@@ -1,0 +1,27 @@
+name: Build WhateverGreen-HDMIB
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+      - name: Build kext
+        env:
+          WEG_REF: 093e76f
+          LILU_REF: 0249c3a
+        run: bash build_weg_hdmib.sh
+      - name: Package
+        run: |
+          set -e
+          ditto -c -k --sequesterRsrc --keepParent WhateverGreen-HDMIB.kext WhateverGreen-HDMIB-kext.zip
+          shasum -a 256 WhateverGreen-HDMIB-kext.zip | tee SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WhateverGreen-HDMIB-kext
+          path: |
+            WhateverGreen-HDMIB-kext.zip
+            SHA256SUMS.txt
+          if-no-files-found: error
