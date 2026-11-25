@@ -2,11 +2,15 @@
 //  kern_igfx_hdmib.hpp
 //  HDMI on DDI B for AppleIntelICLLPGraphicsFramebuffer (Intel Ice Lake, macOS 15 / 26)
 //
-//  Header-only module for WhateverGreen. Version 1.0-up04.
+//  Header-only module for WhateverGreen. Version 1.0-up06.
 //  Based on upstream 1.0-rc6 (miyatimusica) with these additions only:
 //    * default-on (no -igfxhdmib boot-arg; -igfxhdmiboff disables)
 //    * connector patch injected as DeviceProperties by the module itself (no config framebuffer-patch0 needed)
-//    * 02id (0x8A5C0002) platform-table lookup: one fixed 8 KiB window, 02id only (build script)
+//    * platform-table lookup: one fixed 8 KiB window, target id set by the build script (0x8A510002 since up05)
+//    * up06: LightUpTMDS -> LightUpDP reroute. Apple's ICL LightUpTMDS is a stub that always returns error,
+//      so any wake that needs a complete modeset kills the screen (kernel log: "Returning error in TMDS
+//      modeset as this platform does not do support HDMI/DVI connector"). The DP light-up path is real and
+//      the module's sink fakes already cover it.
 //    * up04: the wake-time HPD race fix from hj13 (wb1, issue #37 port), carried back in full:
 //        - wrapProbePortState: if a probe reads HPD low, wait 1500 us for the SHPD filter to settle and
 //          re-read; only treat it as low if it is still low after settling (the CAUSE fix), and never
@@ -73,7 +77,7 @@
 
 namespace HDMIB {
 
-	static constexpr const char *Version = "1.0-up05";
+	static constexpr const char *Version = "1.0-up06";
 
 	// IOLog directly: Lilu's SYSLOG is silent when interrupts are disabled (hotplug paths run that way).
 	#define HLOG(fmt, ...) do { if (ml_get_interrupts_enabled()) IOLog("HDMIB: " fmt "\n", ## __VA_ARGS__); } while (0)
@@ -160,6 +164,8 @@ namespace HDMIB {
 	static IOReturn (*orgStreamAux)(void *, void *, void *) = nullptr;
 	static bool (*orgCallbackAGDC)(void *, uint32_t, unsigned long, uint32_t) = nullptr;
 	static uint32_t (*orgLightUpTMDS)(void *, void *, void *, void *) = nullptr;
+	static uint32_t (*orgLightUpDP)(void *, void *, void *, void *) = nullptr;
+	static uint32_t tmdsToDp = 0;   // up06: complete-modeset rescues through the real DP light-up path
 	static uint32_t (*orgHwSetMode)(void *, void *, void *, int, void *) = nullptr;
 	static uint32_t (*orgHwSetCursorImage)(void *, void *, void *) = nullptr;
 	static uint32_t (*orgHwSetCursorState)(void *, void *, int, int, bool, bool) = nullptr;
@@ -199,7 +205,7 @@ namespace HDMIB {
 	static void publishStatus() {
 		if (!ml_get_interrupts_enabled()) return;
 		char s[192];
-		snprintf(s, sizeof(s), "hotplugs=%u lowprobes=%u rescued=%u fb=%d ddi=%u", hotplugs, hpdLowProbes, hpdSettleRescues, fbIdx, tddi);
+		snprintf(s, sizeof(s), "hotplugs=%u lowprobes=%u rescued=%u tmdsdp=%u fb=%d ddi=%u", hotplugs, hpdLowProbes, hpdSettleRescues, tmdsToDp, fbIdx, tddi);
 		setRoot("HDMIB-status", s);
 		if (liveEdidOk) {
 			char e[224];
@@ -627,7 +633,19 @@ namespace HDMIB {
 	}
 
 	static uint32_t wrapLightUpTMDS(void *ctl, void *fb, void *path, void *timing) {
-		if (isTargetFb(fb)) ensureDbuf2(ctl);
+		if (isTargetFb(fb)) {
+			ensureDbuf2(ctl);
+			if (orgLightUpDP) {
+				// up06: Apple's Ice Lake LightUpTMDS is a stub that ALWAYS returns error ("Returning error
+				// in TMDS modeset as this platform does not do support HDMI/DVI connector") because every
+				// Ice Lake Mac ships HDMI via DP dongles only. Whenever a wake needs a complete modeset,
+				// hwSetMode dispatches here by port type and the screen is guaranteed dead. LightUpDP is
+				// the real light-up path (power wells, clocks, AGDC link event, scaler, pipe enable); the
+				// module's AGDC/AUX/online hooks already fake the sink side, so send the HDMI port there.
+				tmdsToDp++;
+				return orgLightUpDP(ctl, fb, path, timing);
+			}
+		}
 		return orgLightUpTMDS(ctl, fb, path, timing);
 	}
 	static uint32_t wrapHwSetMode(void *ctl, void *fb, void *path, int m, void *timing) {
@@ -796,6 +814,10 @@ namespace HDMIB {
 		auto apr = solve("__ZN21AppleIntelFramebuffer28allocateDisplayPathResourcesEjj");
 		auto ihpd = solve("__ZN31AppleIntelFramebufferController9InjectHPDEP21AppleIntelFramebuffer");
 		auto uc = solve("__ZN31AppleIntelFramebufferController20hwUpdateCursorMemoryEP21AppleIntelFramebuffer");
+		// up06: real DP light-up path, used to replace the always-failing LightUpTMDS stub (optional: if
+		// missing, the stub keeps its stock failing behaviour).
+		auto ldp = solve("__ZN31AppleIntelFramebufferController9LightUpDPEP21AppleIntelFramebufferP21AppleIntelDisplayPathPK29IODetailedTimingInformationV2");
+		if (ldp) orgLightUpDP = reinterpret_cast<uint32_t (*)(void *, void *, void *, void *)>(ldp);
 		if (!gp || !hp || !rr || !wrg || !ihpd) {
 			HLOG_ALWAYS("required symbols missing (getPortByDDI=%d isHPDLow=%d ReadRegister32=%d WriteRegister32=%d InjectHPD=%d): module idle",
 			            gp != 0, hp != 0, rr != 0, wrg != 0, ihpd != 0);
