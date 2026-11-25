@@ -2,10 +2,16 @@
 //  kern_igfx_hdmib.hpp
 //  HDMI on DDI B for AppleIntelICLLPGraphicsFramebuffer (Intel Ice Lake, macOS 15 / 26)
 //
-//  Header-only module for WhateverGreen. Version 1.0-up06.
+//  Header-only module for WhateverGreen. Version 1.0-up07.
 //  Based on upstream 1.0-rc6 (miyatimusica) with these additions only:
 //    * default-on (no -igfxhdmib boot-arg; -igfxhdmiboff disables)
 //    * connector patch injected as DeviceProperties by the module itself (no config framebuffer-patch0 needed)
+//    * platform-table scan retargeted to 0x8A510002 (02id 0x8A5C0002 has a defective wake path; both
+//      ids share the same connector template, so the same find/replace bytes work on 8A51)
+//    * wake complete-modeset rescue: Apple's Ice Lake LightUpTMDS is a stub that ALWAYS errors, so a
+//      wake needing a full modeset can never light the HDMI port; from 90s after boot the module
+//      reroutes it to the real LightUpDP instead (boot window keeps stock behaviour, bit-identical
+//      to the proven-safe up05 boot)
 //    * platform-table lookup: one fixed 8 KiB window, target id set by the build script (0x8A510002 since up05)
 //    * up06: LightUpTMDS -> LightUpDP reroute. Apple's ICL LightUpTMDS is a stub that always returns error,
 //      so any wake that needs a complete modeset kills the screen (kernel log: "Returning error in TMDS
@@ -77,7 +83,7 @@
 
 namespace HDMIB {
 
-	static constexpr const char *Version = "1.0-up06";
+	static constexpr const char *Version = "1.0-up07";
 
 	// IOLog directly: Lilu's SYSLOG is silent when interrupts are disabled (hotplug paths run that way).
 	#define HLOG(fmt, ...) do { if (ml_get_interrupts_enabled()) IOLog("HDMIB: " fmt "\n", ## __VA_ARGS__); } while (0)
@@ -166,6 +172,7 @@ namespace HDMIB {
 	static uint32_t (*orgLightUpTMDS)(void *, void *, void *, void *) = nullptr;
 	static uint32_t (*orgLightUpDP)(void *, void *, void *, void *) = nullptr;
 	static uint32_t tmdsToDp = 0;   // up06: complete-modeset rescues through the real DP light-up path
+	static uint64_t moduleStartAbs = 0;   // up07: mach_absolute_time at hook install; reroute only after 90s
 	static uint32_t (*orgHwSetMode)(void *, void *, void *, int, void *) = nullptr;
 	static uint32_t (*orgHwSetCursorImage)(void *, void *, void *) = nullptr;
 	static uint32_t (*orgHwSetCursorState)(void *, void *, int, int, bool, bool) = nullptr;
@@ -642,8 +649,16 @@ namespace HDMIB {
 				// hwSetMode dispatches here by port type and the screen is guaranteed dead. LightUpDP is
 				// the real light-up path (power wells, clocks, AGDC link event, scaler, pipe enable); the
 				// module's AGDC/AUX/online hooks already fake the sink side, so send the HDMI port there.
-				tmdsToDp++;
-				return orgLightUpDP(ctl, fb, path, timing);
+				// up07: only AFTER the boot window. Evidence from the 17:22 hard-hang boot: no
+				// "Lighting up TMDS" dispatch was ever logged, so boot never reaches this wrapper for a
+				// modeset (boot lights the port via the AGDC virtual-online path). The uptime guard makes
+				// boot behaviour bit-identical to the proven-safe up05 while keeping the wake rescue.
+				uint64_t now = mach_absolute_time();
+				if (moduleStartAbs != 0 && now - moduleStartAbs > 90ULL * 1000000000ULL) {
+					tmdsToDp++;
+					HLOG("tmds->dp reroute #%u (wake complete modeset)", tmdsToDp);
+					return orgLightUpDP(ctl, fb, path, timing);
+				}
 			}
 		}
 		return orgLightUpTMDS(ctl, fb, path, timing);
@@ -805,6 +820,7 @@ namespace HDMIB {
 		rgbMode = intArg("igfxhdmib-rgb", -1);
 
 		auto solve = [&](const char *sym) { return patcher.solveSymbol(index, sym, address, size); };
+		moduleStartAbs = mach_absolute_time();   // up07: reroute boot-phase guard reference
 		auto gp = solve("__ZN14AppleIntelPort12getPortByDDIEj");
 		auto hp = solve("__ZN14AppleIntelPort8isHPDLowEv");
 		auto rr = solve("__ZN31AppleIntelFramebufferController14ReadRegister32Em");
