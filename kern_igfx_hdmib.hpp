@@ -73,7 +73,7 @@
 
 namespace HDMIB {
 
-	static constexpr const char *Version = "1.0-up04";
+	static constexpr const char *Version = "1.0-up05";
 
 	// IOLog directly: Lilu's SYSLOG is silent when interrupts are disabled (hotplug paths run that way).
 	#define HLOG(fmt, ...) do { if (ml_get_interrupts_enabled()) IOLog("HDMIB: " fmt "\n", ## __VA_ARGS__); } while (0)
