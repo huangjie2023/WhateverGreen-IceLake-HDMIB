@@ -2,12 +2,21 @@
 //  kern_igfx_hdmib.hpp
 //  HDMI on DDI B for AppleIntelICLLPGraphicsFramebuffer (Intel Ice Lake, macOS 15 / 26)
 //
-//  Header-only module for WhateverGreen. Version 1.0-up02.
-//  Based on upstream 1.0-rc6 (miyatimusica) with three additions only:
+//  Header-only module for WhateverGreen. Version 1.0-up04.
+//  Based on upstream 1.0-rc6 (miyatimusica) with these additions only:
 //    * default-on (no -igfxhdmib boot-arg; -igfxhdmiboff disables)
 //    * connector patch injected as DeviceProperties by the module itself (no config framebuffer-patch0 needed)
 //    * 02id (0x8A5C0002) platform-table lookup: one fixed 8 KiB window, 02id only (build script)
-//  probePortState and all functional hooks are left exactly as upstream rc6.
+//    * up04: the wake-time HPD race fix from hj13 (wb1, issue #37 port), carried back in full:
+//        - wrapProbePortState: if a probe reads HPD low, wait 1500 us for the SHPD filter to settle and
+//          re-read; only treat it as low if it is still low after settling (the CAUSE fix), and never
+//          write portState=0 on the low path (the RESULT fix). Kernel log proof from the up03 run:
+//          after the first wake, Apple re-enumerates within microseconds of the HPD input being
+//          re-enabled, latches a false state, treats DDI B as a DP sink again (fIsHDMI=0), and the
+//          AUX-DPCD writes fail forever (writeAUX 0x4e0, 0xe00002f0) in a 3-4 s hotplug loop.
+//        - wrapGetDDCBlock: no ensurePW() here, exactly as hj13 measured it (writing the power well
+//          from inside Apple's own wake-time DDC transaction stalls the GMBUS counter).
+//  All other functional hooks are left exactly as upstream rc6.
 //
 //  Why it exists
 //  -------------
@@ -64,7 +73,7 @@
 
 namespace HDMIB {
 
-	static constexpr const char *Version = "1.0-up03";
+	static constexpr const char *Version = "1.0-up04";
 
 	// IOLog directly: Lilu's SYSLOG is silent when interrupts are disabled (hotplug paths run that way).
 	#define HLOG(fmt, ...) do { if (ml_get_interrupts_enabled()) IOLog("HDMIB: " fmt "\n", ## __VA_ARGS__); } while (0)
@@ -158,6 +167,10 @@ namespace HDMIB {
 	static void (*orgEnableHWDC6)(void *) = nullptr;
 
 	static uint32_t hotplugs = 0, lastPortMode = 0;   // hotplugs: verification counter; lastPortMode: functional (bootDetect)
+	// up04 (hj13 wb1, issue #37 port): the wake-time HPD race counters. The only diagnostics kept from hj13:
+	// hpdSettleRescues > 0 after a wake is the direct proof the settle fix did its job.
+	static int      hpdSettleEnabled = 1;   // wait for the SHPD filter before trusting a low isHPDLow()
+	static uint32_t hpdLowProbes = 0, hpdSettleChecks = 0, hpdSettleRescues = 0;
 
 	// ---------------------------------------------------------------------------------------------------------------------
 	// Helpers
@@ -186,7 +199,7 @@ namespace HDMIB {
 	static void publishStatus() {
 		if (!ml_get_interrupts_enabled()) return;
 		char s[192];
-		snprintf(s, sizeof(s), "hotplugs=%u fb=%d ddi=%u", hotplugs, fbIdx, tddi);
+		snprintf(s, sizeof(s), "hotplugs=%u lowprobes=%u rescued=%u fb=%d ddi=%u", hotplugs, hpdLowProbes, hpdSettleRescues, fbIdx, tddi);
 		setRoot("HDMIB-status", s);
 		if (liveEdidOk) {
 			char e[224];
@@ -451,11 +464,34 @@ namespace HDMIB {
 	static uint32_t wrapProbePortState(void *that) {
 		if (!isTarget(that)) return orgProbePortState(that);
 		bool hpdLow = isHPDLow ? isHPDLow(that) : true;
+		// up04 — hj13 wb1, port of issue #37 (HP Elite Dragonfly G2 / Tiger Lake DDI-B HDMI):
+		// on wake, AppleIntelPort::probePortState() is called within microseconds of the DDI-B HPD input being
+		// (re)enabled. SHPD_FILTER_CNT needs ~500 us to settle, so the first read can latch a false LOW even though
+		// the sink is still connected; that latches portState=0 and the port is dropped from the wake list. On this
+		// Ice Lake machine the input is already enabled in steady state (measured ddi_b_hpd_en=1, sde_b_hpd=1), so
+		// this is NOT a boot-time enable problem — it is the wake-time race. up03 handled only the *result* (don't
+		// write 0 on a low probe) and still failed on the first wake: with the stale portState kept, Apple's own
+		// re-enumeration ran with the race intact and re-registered the port as a DP sink (fIsHDMI=0), which then
+		// looped on AUX-DPCD writes forever. This adds the *cause* fix from hj13: if a probe sees LOW, wait 1500 us
+		// for the filter and re-read; only commit the low path if it is still low after settling. Read-only apart
+		// from IODelay — no register is written, so it cannot reintroduce the power-well/DBUF regressions.
+		// Disabled by igfxhdmib-hpdsettle=0 to fall back to the plain "never write 0" behaviour.
+		if (hpdLow && hpdSettleEnabled) {
+			hpdSettleChecks++;
+			IODelay(1500);
+			bool hpdLowAfter = isHPDLow ? isHPDLow(that) : true;
+			if (!hpdLowAfter) {
+				hpdSettleRescues++;
+				hpdLow = false;    // line recovered after the filter settled: treat as connected
+			}
+		}
 		if (hpdLow) {
-			// up03: keep the last portState instead of writing 0. HPD pulses low for milliseconds during
-			// every sleep/wake cycle; writing 0 then takes the framebuffer off Apple's wake list (the
-			// failure shape: timing stays 148.5 MHz but AAPL,DisplayPipe goes 0xFFFF and the port never
-			// comes back without a reboot). A real unplug is still retired by Apple's own hotplug handler.
+			// Do NOT write 0 here (hj13 result fix, kept): HPD on this port pulses low for a few milliseconds during
+			// every sleep/wake cycle, and that is exactly when Apple calls probePortState to decide whether the
+			// framebuffer still owns a pipe. Writing 0 at that moment takes the framebuffer off the wake list.
+			// Keeping the previous value (2 stays 2, 0 stays 0) costs nothing when the port is really alive, and
+			// Apple's own hotplug handler retires a genuinely unplugged sink.
+			hpdLowProbes++;
 			return rd<uint32_t>(that, L->portState);
 		}
 		wr<uint32_t>(that, L->portState, 1);
@@ -476,7 +512,12 @@ namespace HDMIB {
 	}
 	static int wrapGetDDCBlock(void *that, uint32_t block, uint8_t *buf, bool flag) {
 		if (!isTarget(that)) return orgGetDDCBlock(that, block, buf, flag);
-		ensurePW();
+		// up04 (hj13): no ensurePW() here. This call site runs once per wake, inside Apple's own DDC transaction, and
+		// the power-well write is a Haswell-style guess (STATE at bit 2n, REQUEST at 2n+1) aimed at an Ice Lake
+		// register Apple is actively driving: waking from sleep is exactly when the wells are in transition. hj13
+		// measured enpw going up by exactly one per wake even on the wakes that failed with a flat GMBUS counter,
+		// i.e. this site was the only code touching a register. If Apple's read fails because the well is genuinely
+		// down, the cached EDID below covers it.
 		int ret = orgGetDDCBlock(that, block, buf, flag);
 		if (ret != 0 && (block == 1 || block == 2) && buf) {
 			// The sink did not answer through Apple's (DisplayPort-oriented) DDC path: hand over the EDID we read ourselves
@@ -741,6 +782,7 @@ namespace HDMIB {
 		swCursorAll = intArg("igfxhdmib-swcursor", 0);
 		auxBlockEnabled = intArg("igfxhdmib-aux", 1);
 		dc6FixEnabled = intArg("igfxhdmib-dc6fix", 1);
+		hpdSettleEnabled = intArg("igfxhdmib-hpdsettle", 1) != 0;   // up04: hj13 wake-race settle (0 = plain "never write 0")
 		edidFallback = intArg("igfxhdmib-edid-fallback", 0);
 		rgbMode = intArg("igfxhdmib-rgb", -1);
 
