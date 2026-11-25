@@ -2,7 +2,7 @@
 //  kern_igfx_hdmib.hpp
 //  HDMI on DDI B for AppleIntelICLLPGraphicsFramebuffer (Intel Ice Lake, macOS 15 / 26)
 //
-//  Header-only module for WhateverGreen. Version 1.0-up07.
+//  Header-only module for WhateverGreen. Version 1.0-up08.
 //  Based on upstream 1.0-rc6 (miyatimusica) with these additions only:
 //    * default-on (no -igfxhdmib boot-arg; -igfxhdmiboff disables)
 //    * connector patch injected as DeviceProperties by the module itself (no config framebuffer-patch0 needed)
@@ -83,7 +83,7 @@
 
 namespace HDMIB {
 
-	static constexpr const char *Version = "1.0-up07";
+	static constexpr const char *Version = "1.0-up08";
 
 	// IOLog directly: Lilu's SYSLOG is silent when interrupts are disabled (hotplug paths run that way).
 	#define HLOG(fmt, ...) do { if (ml_get_interrupts_enabled()) IOLog("HDMIB: " fmt "\n", ## __VA_ARGS__); } while (0)
@@ -173,6 +173,18 @@ namespace HDMIB {
 	static uint32_t (*orgLightUpDP)(void *, void *, void *, void *) = nullptr;
 	static uint32_t tmdsToDp = 0;   // up06: complete-modeset rescues through the real DP light-up path
 	static uint64_t moduleStartAbs = 0;   // up07: mach_absolute_time at hook install; reroute only after 90s
+	// up08: wake replug pulse. The 18:40:50 wake proved WindowServer DOES issue a setMode right after
+	// wake, but Apple rejects it with "Ignoring mode set on unplugged display" because fOnline is
+	// still 0 during the wake race; once the port comes online nobody re-issues a mode set and the
+	// port stays "online but not enabled" forever (no hwSetMode, so the reroute never gets a chance).
+	// Fix: a few seconds after each wake, report the sink offline for one poll window — WindowServer
+	// then tears the display down and, on the next online report, runs a fresh connect, which is the
+	// only path that ends in a real hwSetMode (and thus in the TMDS->DP reroute).
+	static uint64_t lastTgtHotplugAbs = 0;
+	static uint64_t replugArmAbs = 0;
+	static int      replugStage = 0;      // 0 = pulse allowed, 1 = offline window open, 2 = done for this wake
+	static uint32_t replugPulses = 0;
+	static IOTimerEventSource *replugTimer = nullptr;
 	static uint32_t (*orgHwSetMode)(void *, void *, void *, int, void *) = nullptr;
 	static uint32_t (*orgHwSetCursorImage)(void *, void *, void *) = nullptr;
 	static uint32_t (*orgHwSetCursorState)(void *, void *, int, int, bool, bool) = nullptr;
@@ -212,7 +224,7 @@ namespace HDMIB {
 	static void publishStatus() {
 		if (!ml_get_interrupts_enabled()) return;
 		char s[192];
-		snprintf(s, sizeof(s), "hotplugs=%u lowprobes=%u rescued=%u tmdsdp=%u fb=%d ddi=%u", hotplugs, hpdLowProbes, hpdSettleRescues, tmdsToDp, fbIdx, tddi);
+		snprintf(s, sizeof(s), "hotplugs=%u lowprobes=%u rescued=%u tmdsdp=%u replug=%u fb=%d ddi=%u", hotplugs, hpdLowProbes, hpdSettleRescues, tmdsToDp, replugPulses, fbIdx, tddi);
 		setRoot("HDMIB-status", s);
 		if (liveEdidOk) {
 			char e[224];
@@ -543,6 +555,18 @@ namespace HDMIB {
 	static IOReturn wrapGetOnlineInfo(void *that, void *path, uint8_t *a, uint8_t *b) {
 		auto ret = orgGetOnlineInfo(that, path, a, b);
 		if (a && b && isTargetFb(that) && getPortByDDI && isHPDLow) {
+			// up08: during the replug-pulse window report the sink as UNPLUGGED. WindowServer then
+			// disconnects the display; on the next poll (window closed) it reconnects and issues a
+			// real mode set, which is what "Ignoring mode set on unplugged display" swallowed.
+			if (replugStage == 1) {
+				if (mach_absolute_time() - replugArmAbs < 3000ULL * 1000000000ULL) {
+					*a = 0;
+					ret = 0;
+					return ret;
+				}
+				replugStage = 2;
+				HLOG("replug window closed via poll");
+			}
 			// The caller sets fb->flags = *online: report the HDMI sink as online together with its EDID
 			auto prt = getPortByDDI(tddi);
 			if (ptrOk(prt) && !isHPDLow(prt) && rd<uint32_t>(prt, L->portState) != 0) {
@@ -582,6 +606,33 @@ namespace HDMIB {
 		t->setTimeoutMS((UInt32)bootDetectSec * 1000u);
 	}
 
+	// up08: wake replug pulse — fire 3s after a wake is detected; the offline window stays open 3s
+	// (covers hotplug/enumeration loops with a 3-6s period) and is closed either by a poll after the
+	// window or by this timer, whichever comes first.
+	static void replugFire(OSObject *owner, IOTimerEventSource *) {
+		if (replugStage == 0) {
+			replugStage = 1;
+			replugPulses++;
+			replugArmAbs = mach_absolute_time();
+			HLOG("wake replug pulse #%u: offline window open", replugPulses);
+			if (replugTimer) replugTimer->setTimeoutMS(3000);   // close even if no poll arrives
+		} else if (replugStage == 1) {
+			replugStage = 2;
+			HLOG("wake replug pulse: window closed, reporting online again");
+		}
+		publishStatus();
+	}
+	static void armReplugTimer(void *ctl) {
+		if (replugTimer || !ptrOk(ctl)) return;
+		auto svc = reinterpret_cast<IOService *>(ctl);
+		IOWorkLoop *wl = svc->getWorkLoop();
+		if (!wl) { HLOG("replug: no workloop"); return; }
+		auto t = IOTimerEventSource::timerEventSource(reinterpret_cast<OSObject *>(ctl), replugFire);
+		if (!t) { HLOG("replug: no timer"); return; }
+		if (wl->addEventSource(t) != 0) { t->release(); HLOG("replug: addEventSource failed"); return; }
+		replugTimer = t;
+	}
+
 	static void wrapHotplug(void *ctl, uint32_t ddi, uint32_t portMode) {
 		bool tgt = (ddi == tddi);
 		if (tgt) {
@@ -589,6 +640,19 @@ namespace HDMIB {
 			lastPortMode = portMode;
 			gCtl = ctl;
 			ensureDbuf2(ctl);
+			// up08: wake detection — one replug pulse per wake; never at boot (90s gate) and never for
+			// hotplug bursts of the same wake (30s of silence separates two wakes).
+			if (moduleStartAbs != 0 && replugTimer) {
+				uint64_t now = mach_absolute_time();
+				bool wakePhase = now - moduleStartAbs > 90ULL * 1000000000ULL;
+				bool newWake = wakePhase && (lastTgtHotplugAbs == 0 || now - lastTgtHotplugAbs > 30ULL * 1000000000ULL);
+				lastTgtHotplugAbs = now;
+				if (newWake) {
+					replugStage = 0;
+					replugTimer->setTimeoutMS(3000);
+					HLOG("wake detected: replug pulse fires in 3s");
+				}
+			}
 			auto tp = getPortByDDI ? getPortByDDI(tddi) : nullptr;
 			if (isHPDLow && ptrOk(tp) && isHPDLow(tp)) liveEdidOk = false;   // cable/monitor removed: forget its EDID
 			else readLiveEdid(ctl);
@@ -665,6 +729,7 @@ namespace HDMIB {
 	}
 	static uint32_t wrapHwSetMode(void *ctl, void *fb, void *path, int m, void *timing) {
 		armBootDetect(ctl);
+		armReplugTimer(ctl);   // up08: create the wake-pulse timer on the controller's workloop
 		if (isTargetFb(fb)) ensureDbuf2(ctl);
 		return orgHwSetMode(ctl, fb, path, m, timing);
 	}
