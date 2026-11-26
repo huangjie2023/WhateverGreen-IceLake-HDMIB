@@ -677,6 +677,24 @@ namespace HDMIB {
 		if (!patcher.routeMultiple(index, &rq, 1, address, size)) HLOG_ALWAYS("optional hook %s could not be routed", what);
 	}
 
+	static void injectDeviceProperties(IORegistryEntry *igpu) {
+		if (!igpu) return;
+		if (igpu->getProperty("framebuffer-patch0-find")) return;
+		auto setBytes = [&](const char *key, const void *bytes, uint32_t len) {
+			auto data = OSData::withBytes(bytes, len);
+			if (!data) return;
+			igpu->setProperty(key, data);
+			data->release();
+		};
+		static const uint32_t find[6]    = {3, 10, 1, 1, 0x400, 0x2c1};
+		static const uint32_t replace[6] = {1, 2,  2, 0, 0x800, 0x2c1};
+		uint32_t on = 1;
+		setBytes("framebuffer-patch-enable", &on, sizeof(on));
+		setBytes("framebuffer-patch0-enable", &on, sizeof(on));
+		setBytes("framebuffer-patch0-find", find, sizeof(find));
+		setBytes("framebuffer-patch0-replace", replace, sizeof(replace));
+	}
+
 	static inline void install(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
 		if (checkKernelArgument("-igfxhdmiboff")) return;
 		if (kextIntelICLLPFb.loadIndex != index) return;      // only the Ice Lake LP framebuffer kext
