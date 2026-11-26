@@ -30,6 +30,7 @@ cp -R MacKernelSDK WhateverGreen/MacKernelSDK
 cp "$HERE/kern_igfx_hdmib.hpp" WhateverGreen/WhateverGreen/
 F=WhateverGreen/WhateverGreen/kern_igfx.cpp
 perl -0pi -e 's/(#include "kern_igfx\.hpp"\n)/$1#include "kern_igfx_hdmib.hpp"\n/' "$F"
+perl -0pi -e 's/(\t\tapplyFramebufferPatch = loadPatchesFromDevice\()/\t\tHDMIB::injectDeviceProperties(info->videoBuiltin);\n\n$1/' "$F"
 perl -0pi -e 's/(\t\tif \(applyFramebufferPatch \|\| dumpFramebufferToDisk \|\| dumpPlatformTable \|\| hdmiAutopatch\) \{\n\t\t\tframebufferStart)/\t\tHDMIB::install(patcher, index, address, size);\n\n$1/' "$F"
 cat > "$W/find_framebuffer_id.cpp" <<'FBIDEOF'
 uint8_t *IGFX::findFramebufferId(uint32_t framebufferId, uint8_t *startingAddress, size_t maxSize) {
@@ -48,6 +49,7 @@ FBID_NEW="$W/find_framebuffer_id.cpp" perl -0777 -i -pe '
 	s{uint8_t \*IGFX::findFramebufferId\(uint32_t framebufferId, uint8_t \*startingAddress, size_t maxSize\) \{.*?\n\}}{$new}s;
 ' "$F"
 [ "$(grep -c 'HDMIB::install' "$F")" = "1" ] && [ "$(grep -c 'kern_igfx_hdmib.hpp' "$F")" = "1" ] \
+  && [ "$(grep -c 'HDMIB::injectDeviceProperties' "$F")" = "1" ] \
   && [ "$(grep -c '0x8A5C0002u' "$F")" = "1" ] \
   || { echo "ERROR: the edits to kern_igfx.cpp could not be applied (this WhateverGreen version differs). See README.md, 'Hooking into WhateverGreen'."; exit 1; }
 
