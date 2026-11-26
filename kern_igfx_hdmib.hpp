@@ -678,7 +678,7 @@ namespace HDMIB {
 	}
 
 	static inline void install(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
-		if (!checkKernelArgument("-igfxhdmib")) return;
+		if (checkKernelArgument("-igfxhdmiboff")) return;
 		if (kextIntelICLLPFb.loadIndex != index) return;      // only the Ice Lake LP framebuffer kext
 		HLOG_ALWAYS("v%s starting on Darwin %u", Version, (unsigned)getKernelVersion());
 
