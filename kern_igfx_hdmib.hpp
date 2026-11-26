@@ -33,6 +33,8 @@
 //    igfxhdmib-edid-fallback=1  if the monitor's EDID cannot be read, present a generic 1024x768@60 EDID instead of nothing
 //    igfxhdmib-onlinefix=1    after an HPD-low edge, answer getOnlineInfo offline exactly once, so macOS tears down the
 //                             stale display path and the next HPD-high rebuilds it (experimental; default 0 = old behaviour)
+//    igfxhdmib-realonline=1   drive the framebuffer's real online byte (fb[+0x1e1], the one getOnlineInfo reads): clear it on
+//                             HPD-low so the system sees a genuine disconnect, set it on HPD-high to rebuild (default 0)
 //    igfxhdmib-rgb=-1|0|1|2   colour-format control. A sink that advertises YCbCr makes the driver send YCbCr 4:4:4 in the HDMI AVI
 //                             infoframe, which this path cannot handle (purple/magenta picture).
 //                               -1 (default) = automatic: if the EDID advertises YCbCr, behave as 2; otherwise leave the EDID untouched
@@ -79,7 +81,8 @@ namespace HDMIB {
 		uint32_t portIndex      = 0x1c;    // index of the framebuffer that owns the port
 		// AppleIntelFramebuffer
 		uint32_t fbIndex        = 0x1dc;   // framebuffer number (0 = internal panel)
-		uint32_t fbFlags        = 0x1e0;   // bit 0 = "online/active"
+		uint32_t fbFlags        = 0x1e0;   // bit 0 = "active/enable" (connectionChanged writes this)
+		uint32_t fbOnline       = 0x1e1;   // bit 0 = "online" — the byte Apple's getOnlineInfo actually reads (0x141df306)
 		uint32_t fbCursorMem    = 0x1f8;   // two u32 cursor buffer addresses
 		uint32_t fbCfgTable     = 0x20d;   // resource-configuration table (count + entries)
 		uint32_t fbCfgTableLen  = 0x3e0;
@@ -129,6 +132,9 @@ namespace HDMIB {
 	static int      onlineFix = 0;            // igfxhdmib-onlinefix=1: report the target fb offline once after each HPD-low edge
 	static uint32_t offlineOnce = 0;          // armed by an HPD-low edge; consumed by the next getOnlineInfo query
 	static uint32_t offlineReported = 0;      // how many forced-offline replies were actually delivered
+	static int      realOnline = 0;           // igfxhdmib-realonline=1: drive fb[+0x1e1] (the byte getOnlineInfo reads) directly
+	static uint32_t onlineCleared = 0;        // HPD-low: cleared fb online bit so the system sees a real disconnect
+	static uint32_t onlineSet = 0;            // HPD-high: set fb online bit so the system sees a real connect
 	static void    *gCtl = nullptr;           // AppleIntelFramebufferController, captured at the first hotplug
 
 	static void *(*getPortByDDI)(uint32_t) = nullptr;
@@ -187,8 +193,8 @@ namespace HDMIB {
 	static void publishStatus() {
 		if (!ml_get_interrupts_enabled()) return;
 		char s[192];
-		snprintf(s, sizeof(s), "hotplugs=%u edid-ok=%u edid-fail=%u dbuf-fixed=%u dc6-skipped=%u aux-blocked=%u cursor-blocked=%u fb=%d ddi=%u onlinefix=%d offrep=%u",
-		         hotplugs, edidReads, edidFails, dbufFixed, dc6Skipped, auxBlocked, cursorBlocked, fbIdx, tddi, onlineFix, offlineReported);
+		snprintf(s, sizeof(s), "hotplugs=%u edid-ok=%u edid-fail=%u dbuf-fixed=%u dc6-skipped=%u aux-blocked=%u cursor-blocked=%u fb=%d ddi=%u onlinefix=%d offrep=%u realonline=%d onclr=%u onset=%u",
+		         hotplugs, edidReads, edidFails, dbufFixed, dc6Skipped, auxBlocked, cursorBlocked, fbIdx, tddi, onlineFix, offlineReported, realOnline, onlineCleared, onlineSet);
 		setRoot("HDMIB-status", s);
 		if (liveEdidOk) {
 			char e[224];
@@ -495,6 +501,19 @@ namespace HDMIB {
 				*a = 0;
 				return 0;
 			}
+			// realOnline: report whatever Apple's own online byte (fb[+0x1e1]) says — no forced online.
+			// The HPD-low path clears that byte, so the system now sees a genuine disconnect.
+			if (realOnline) {
+				uint8_t ob = rd<uint8_t>(that, L->fbOnline) & 1;
+				*a = ob;
+				if (ob) {
+					auto prt = getPortByDDI(tddi);
+					if (ptrOk(prt) && !isHPDLow(prt)) {
+						if (auto src = edidFor(1)) for (int i = 0; i < 128; i++) b[i] = src[i];
+					}
+				}
+				return 0;
+			}
 			// The caller sets fb->flags = *online: report the HDMI sink as online together with its EDID
 			auto prt = getPortByDDI(tddi);
 			if (ptrOk(prt) && !isHPDLow(prt) && rd<uint32_t>(prt, L->portState) != 0) {
@@ -545,6 +564,20 @@ namespace HDMIB {
 			if (isHPDLow && ptrOk(tp) && isHPDLow(tp)) {   // cable/monitor removed: forget its EDID
 				liveEdidOk = false; edidForgotten++;
 				if (onlineFix) offlineOnce = 1;            // onlinefix: make the next online query report offline once
+				// realOnline: clear Apple's online byte on the target fb so the system sees a genuine disconnect
+				// and tears down the stale display path. Without this the fb stays "online" forever after wake.
+				if (realOnline) {
+					uint32_t idx = rd<uint32_t>(tp, L->portIndex);
+					uint32_t nfb = rd<uint32_t>(ctl, L->ctlFbCount);
+					if (idx < nfb && idx < 3) {
+						auto fb = rd<uint8_t *>(ctl, L->ctlFbArray + 8 * idx);
+						if (ptrOk(fb) && rd<uint32_t>(fb, L->fbIndex) == idx) {
+							wr<uint8_t>(fb, L->fbOnline, 0);
+							wr<uint8_t>(fb, L->fbFlags, rd<uint8_t>(fb, L->fbFlags) & ~1);
+							onlineCleared++;
+						}
+					}
+				}
 			}
 			else readLiveEdid(ctl);
 		}
@@ -580,6 +613,8 @@ namespace HDMIB {
 								if (ptrOk(dpx) && ptrOk(prt) && rd<void *>(dpx, L->pathPort) == nullptr) wr<void *>(dpx, L->pathPort, prt);
 							}
 							wr<uint8_t>(fb, L->fbFlags, rd<uint8_t>(fb, L->fbFlags) | 1);
+							// realOnline: restore Apple's online byte so the system sees a real connect and rebuilds the path
+							if (realOnline) { wr<uint8_t>(fb, L->fbOnline, 1); onlineSet++; }
 							// resource-configuration table (count + entry 0), cloned from the internal framebuffer's committed one,
 							// so setupDisplayTiming() can resolve the entry index it gets back from the client
 							auto fb0 = rd<uint8_t *>(ctl, L->ctlFbArray);
@@ -743,6 +778,7 @@ namespace HDMIB {
 		dc6FixEnabled = intArg("igfxhdmib-dc6fix", 1);
 		edidFallback = intArg("igfxhdmib-edid-fallback", 0);
 		onlineFix = intArg("igfxhdmib-onlinefix", 0);
+		realOnline = intArg("igfxhdmib-realonline", 0);
 		rgbMode = intArg("igfxhdmib-rgb", -1);
 
 		auto solve = [&](const char *sym) { return patcher.solveSymbol(index, sym, address, size); };
