@@ -31,6 +31,8 @@
 //    igfxhdmib-aux=0          do not short-circuit the AUX reads the accelerator keeps issuing for the HDMI stream
 //    igfxhdmib-dc6fix=0       do not skip the second enableHWDC6() (panic "DC6 is already enabled")
 //    igfxhdmib-edid-fallback=1  if the monitor's EDID cannot be read, present a generic 1024x768@60 EDID instead of nothing
+//    igfxhdmib-onlinefix=1    after an HPD-low edge, answer getOnlineInfo offline exactly once, so macOS tears down the
+//                             stale display path and the next HPD-high rebuilds it (experimental; default 0 = old behaviour)
 //    igfxhdmib-rgb=-1|0|1|2   colour-format control. A sink that advertises YCbCr makes the driver send YCbCr 4:4:4 in the HDMI AVI
 //                             infoframe, which this path cannot handle (purple/magenta picture).
 //                               -1 (default) = automatic: if the EDID advertises YCbCr, behave as 2; otherwise leave the EDID untouched
@@ -124,6 +126,9 @@ namespace HDMIB {
 	static int      fbIdx = 2;                // target framebuffer index
 	static bool     fbIdxFixed = false;       // set by igfxhdmib-fb
 	static int      rgbMode = -1, rgbOnly = 0, hwCursorFb = 1, swCursorAll = 0, auxBlockEnabled = 1, dc6FixEnabled = 1, edidFallback = 0, bootDetectSec = 3;
+	static int      onlineFix = 0;            // igfxhdmib-onlinefix=1: report the target fb offline once after each HPD-low edge
+	static uint32_t offlineOnce = 0;          // armed by an HPD-low edge; consumed by the next getOnlineInfo query
+	static uint32_t offlineReported = 0;      // how many forced-offline replies were actually delivered
 	static void    *gCtl = nullptr;           // AppleIntelFramebufferController, captured at the first hotplug
 
 	static void *(*getPortByDDI)(uint32_t) = nullptr;
@@ -182,8 +187,8 @@ namespace HDMIB {
 	static void publishStatus() {
 		if (!ml_get_interrupts_enabled()) return;
 		char s[192];
-		snprintf(s, sizeof(s), "hotplugs=%u edid-ok=%u edid-fail=%u dbuf-fixed=%u dc6-skipped=%u aux-blocked=%u cursor-blocked=%u fb=%d ddi=%u",
-		         hotplugs, edidReads, edidFails, dbufFixed, dc6Skipped, auxBlocked, cursorBlocked, fbIdx, tddi);
+		snprintf(s, sizeof(s), "hotplugs=%u edid-ok=%u edid-fail=%u dbuf-fixed=%u dc6-skipped=%u aux-blocked=%u cursor-blocked=%u fb=%d ddi=%u onlinefix=%d offrep=%u",
+		         hotplugs, edidReads, edidFails, dbufFixed, dc6Skipped, auxBlocked, cursorBlocked, fbIdx, tddi, onlineFix, offlineReported);
 		setRoot("HDMIB-status", s);
 		if (liveEdidOk) {
 			char e[224];
@@ -482,6 +487,14 @@ namespace HDMIB {
 	static IOReturn wrapGetOnlineInfo(void *that, void *path, uint8_t *a, uint8_t *b) {
 		auto ret = orgGetOnlineInfo(that, path, a, b);
 		if (a && b && isTargetFb(that) && getPortByDDI && isHPDLow) {
+			// onlinefix: after an HPD-low edge, answer offline exactly once so the caller tears down the
+			// stale display path; the following HPD-high re-runs the normal inject path and rebuilds it.
+			if (onlineFix && offlineOnce) {
+				offlineOnce = 0;
+				offlineReported++;
+				*a = 0;
+				return 0;
+			}
 			// The caller sets fb->flags = *online: report the HDMI sink as online together with its EDID
 			auto prt = getPortByDDI(tddi);
 			if (ptrOk(prt) && !isHPDLow(prt) && rd<uint32_t>(prt, L->portState) != 0) {
@@ -529,7 +542,10 @@ namespace HDMIB {
 			gCtl = ctl;
 			ensureDbuf2(ctl);
 			auto tp = getPortByDDI ? getPortByDDI(tddi) : nullptr;
-			if (isHPDLow && ptrOk(tp) && isHPDLow(tp)) { liveEdidOk = false; edidForgotten++; }   // cable/monitor removed: forget its EDID
+			if (isHPDLow && ptrOk(tp) && isHPDLow(tp)) {   // cable/monitor removed: forget its EDID
+				liveEdidOk = false; edidForgotten++;
+				if (onlineFix) offlineOnce = 1;            // onlinefix: make the next online query report offline once
+			}
 			else readLiveEdid(ctl);
 		}
 		orgHotplug(ctl, ddi, portMode);
@@ -726,6 +742,7 @@ namespace HDMIB {
 		auxBlockEnabled = intArg("igfxhdmib-aux", 1);
 		dc6FixEnabled = intArg("igfxhdmib-dc6fix", 1);
 		edidFallback = intArg("igfxhdmib-edid-fallback", 0);
+		onlineFix = intArg("igfxhdmib-onlinefix", 0);
 		rgbMode = intArg("igfxhdmib-rgb", -1);
 
 		auto solve = [&](const char *sym) { return patcher.solveSymbol(index, sym, address, size); };
