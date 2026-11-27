@@ -31,16 +31,15 @@
 //    igfxhdmib-aux=0          do not short-circuit the AUX reads the accelerator keeps issuing for the HDMI stream
 //    igfxhdmib-dc6fix=0       do not skip the second enableHWDC6() (panic "DC6 is already enabled")
 //    igfxhdmib-edid-fallback=1  if the monitor's EDID cannot be read, present a generic 1024x768@60 EDID instead of nothing
-//    igfxhdmib-onlinefix=1    after an HPD-low edge, answer getOnlineInfo offline exactly once, so macOS tears down the
-//                             stale display path and the next HPD-high rebuilds it (experimental; default 0 = old behaviour)
-//    igfxhdmib-realonline=1   drive the framebuffer's real online byte (fb[+0x1e1], the one getOnlineInfo reads): clear it on
-//                             HPD-low so the system sees a genuine disconnect, set it on HPD-high to rebuild (default 0)
 //    igfxhdmib-rgb=-1|0|1|2   colour-format control. A sink that advertises YCbCr makes the driver send YCbCr 4:4:4 in the HDMI AVI
 //                             infoframe, which this path cannot handle (purple/magenta picture).
 //                               -1 (default) = automatic: if the EDID advertises YCbCr, behave as 2; otherwise leave the EDID untouched
 //                                2 = hide YCbCr support AND the CEA extension block, the sink is treated as plain DVI/RGB (no infoframes)
 //                                1 = only hide the YCbCr bits   0 = never touch the EDID
 //    igfxhdmib-force=1        run on a macOS version whose private structure layout has not been verified (see Layout)
+//    igfxhdmib-wakephy=1      DIAGNOSTIC: sample DDI/power-well/DBUF registers on light-up into HDMIB-wakephy (default 0)
+//    igfxhdmib-wakerelight=N  EXPERIMENTAL: N ms after wake, re-run the full hotplug re-enumeration (0 = off, default 0)
+//                             Requires igfxhdmib-wakephy=1. Uses Apple's own connect path; no stale pointers.
 //
 //  Diagnostics:  ioreg -l | grep HDMIB      (HDMIB-status, HDMIB-layout, HDMIB-hooks)
 //                dmesg | grep HDMIB
@@ -63,7 +62,7 @@
 
 namespace HDMIB {
 
-	static constexpr const char *Version = "1.0-rc6";
+	static constexpr const char *Version = "1.0-rc6-wakephy1";
 
 	// IOLog directly: Lilu's SYSLOG is silent when interrupts are disabled (hotplug paths run that way).
 	#define HLOG(fmt, ...) do { if (ml_get_interrupts_enabled()) IOLog("HDMIB: " fmt "\n", ## __VA_ARGS__); } while (0)
@@ -81,8 +80,7 @@ namespace HDMIB {
 		uint32_t portIndex      = 0x1c;    // index of the framebuffer that owns the port
 		// AppleIntelFramebuffer
 		uint32_t fbIndex        = 0x1dc;   // framebuffer number (0 = internal panel)
-		uint32_t fbFlags        = 0x1e0;   // bit 0 = "active/enable" (connectionChanged writes this)
-		uint32_t fbOnline       = 0x1e1;   // bit 0 = "online" — the byte Apple's getOnlineInfo actually reads (0x141df306)
+		uint32_t fbFlags        = 0x1e0;   // bit 0 = "online/active"
 		uint32_t fbCursorMem    = 0x1f8;   // two u32 cursor buffer addresses
 		uint32_t fbCfgTable     = 0x20d;   // resource-configuration table (count + entries)
 		uint32_t fbCfgTableLen  = 0x3e0;
@@ -118,6 +116,8 @@ namespace HDMIB {
 	static constexpr unsigned long REG_DBUF_CTL_S2   = 0x44fe8;
 	static constexpr unsigned long REG_GMBUS0 = 0xC5100, REG_GMBUS1 = 0xC5104, REG_GMBUS2 = 0xC5108, REG_GMBUS3 = 0xC510C,
 	                               REG_GMBUS4 = 0xC5110, REG_GMBUS5 = 0xC5120, REG_GPIO_BASE = 0xC5010;
+	// Register Apple writes in LightUpTMDS: WriteRegister32(pipe*4 + 0x46140, val). Pipe index is display-path -> 0x4d10.
+	static constexpr unsigned long REG_TMDS_BASE = 0x46140;
 
 	// PortConfig as stored by the platform table: six u32 {ddi, gmbus pin, class, pad, type, flags}
 	struct PortConfig { uint32_t ddi, gmbus, cls, pad, type, flags; };
@@ -129,12 +129,6 @@ namespace HDMIB {
 	static int      fbIdx = 2;                // target framebuffer index
 	static bool     fbIdxFixed = false;       // set by igfxhdmib-fb
 	static int      rgbMode = -1, rgbOnly = 0, hwCursorFb = 1, swCursorAll = 0, auxBlockEnabled = 1, dc6FixEnabled = 1, edidFallback = 0, bootDetectSec = 3;
-	static int      onlineFix = 0;            // igfxhdmib-onlinefix=1: report the target fb offline once after each HPD-low edge
-	static uint32_t offlineOnce = 0;          // armed by an HPD-low edge; consumed by the next getOnlineInfo query
-	static uint32_t offlineReported = 0;      // how many forced-offline replies were actually delivered
-	static int      realOnline = 0;           // igfxhdmib-realonline=1: drive fb[+0x1e1] (the byte getOnlineInfo reads) directly
-	static uint32_t onlineCleared = 0;        // HPD-low: cleared fb online bit so the system sees a real disconnect
-	static uint32_t onlineSet = 0;            // HPD-high: set fb online bit so the system sees a real connect
 	static void    *gCtl = nullptr;           // AppleIntelFramebufferController, captured at the first hotplug
 
 	static void *(*getPortByDDI)(uint32_t) = nullptr;
@@ -165,6 +159,11 @@ namespace HDMIB {
 
 	static uint32_t edidForgotten = 0, hotplugs = 0, lastPortMode = 0, edidReads = 0, edidFails = 0, dbufFixed = 0, dc6Skipped = 0, auxBlocked = 0,
 	                cursorBlocked = 0, vrrOff = 0;
+	static int      wakePhyEnabled = 0;              // igfxhdmib-wakephy=1
+	static int      wakeRelightMs = 0;               // igfxhdmib-wakerelight=N, 0 = off
+	static uint32_t wakeSamples = 0, wakeRelights = 0;
+	static bool     relightArmed = false;
+	static void    (*orgPrepareToEnterWake)(void *) = nullptr;
 
 	// ---------------------------------------------------------------------------------------------------------------------
 	// Helpers
@@ -190,12 +189,35 @@ namespace HDMIB {
 	static uint8_t  liveEdid[256];
 	static bool     liveEdidOk = false;
 	static uint32_t gmPin = 0xff, gmMode = 0, gmBlocks = 0;
+	// Snapshot the registers that matter for bringing the HDMI PHY/TMDS back after sleep.
+	// READ ONLY. Never writes hardware state. Safe to call from any context that can read MMIO.
+	static void sampleWakePhy(const char *where) {
+		if (!wakePhyEnabled || !gCtl || !readReg) return;
+		uint32_t pw  = readReg(gCtl, REG_PWR_WELL_CTL2);
+		uint32_t s1  = readReg(gCtl, REG_DBUF_CTL_S1);
+		uint32_t s2  = readReg(gCtl, REG_DBUF_CTL_S2);
+		uint32_t t0  = readReg(gCtl, REG_TMDS_BASE);
+		uint32_t t1  = readReg(gCtl, REG_TMDS_BASE + 4);
+		wakeSamples++;
+		if (!ml_get_interrupts_enabled()) return;
+		char s[256];
+		snprintf(s, sizeof(s), "last=%s samples=%u pw=0x%08x dbuf_s1=0x%08x dbuf_s2=0x%08x tmds0=0x%08x tmds1=0x%08x",
+		         where, wakeSamples, pw, s1, s2, t0, t1);
+		setRoot("HDMIB-wakephy", s);
+	}
+
 	static void publishStatus() {
 		if (!ml_get_interrupts_enabled()) return;
 		char s[192];
-		snprintf(s, sizeof(s), "hotplugs=%u edid-ok=%u edid-fail=%u dbuf-fixed=%u dc6-skipped=%u aux-blocked=%u cursor-blocked=%u fb=%d ddi=%u onlinefix=%d offrep=%u realonline=%d onclr=%u onset=%u",
-		         hotplugs, edidReads, edidFails, dbufFixed, dc6Skipped, auxBlocked, cursorBlocked, fbIdx, tddi, onlineFix, offlineReported, realOnline, onlineCleared, onlineSet);
+		snprintf(s, sizeof(s), "hotplugs=%u edid-ok=%u edid-fail=%u dbuf-fixed=%u dc6-skipped=%u aux-blocked=%u cursor-blocked=%u fb=%d ddi=%u",
+		         hotplugs, edidReads, edidFails, dbufFixed, dc6Skipped, auxBlocked, cursorBlocked, fbIdx, tddi);
 		setRoot("HDMIB-status", s);
+		if (wakePhyEnabled && ml_get_interrupts_enabled()) {
+			char w[96];
+			snprintf(w, sizeof(w), "samples=%u relights=%u relight-ms=%d (sample on LightUpTMDS/hwSetMode/relight)",
+			         wakeSamples, wakeRelights, wakeRelightMs);
+			setRoot("HDMIB-wakephy-stats", w);
+		}
 		if (liveEdidOk) {
 			char e[224];
 			const uint8_t *d = liveEdid;
@@ -493,27 +515,6 @@ namespace HDMIB {
 	static IOReturn wrapGetOnlineInfo(void *that, void *path, uint8_t *a, uint8_t *b) {
 		auto ret = orgGetOnlineInfo(that, path, a, b);
 		if (a && b && isTargetFb(that) && getPortByDDI && isHPDLow) {
-			// onlinefix: after an HPD-low edge, answer offline exactly once so the caller tears down the
-			// stale display path; the following HPD-high re-runs the normal inject path and rebuilds it.
-			if (onlineFix && offlineOnce) {
-				offlineOnce = 0;
-				offlineReported++;
-				*a = 0;
-				return 0;
-			}
-			// realOnline: report whatever Apple's own online byte (fb[+0x1e1]) says — no forced online.
-			// The HPD-low path clears that byte, so the system now sees a genuine disconnect.
-			if (realOnline) {
-				uint8_t ob = rd<uint8_t>(that, L->fbOnline) & 1;
-				*a = ob;
-				if (ob) {
-					auto prt = getPortByDDI(tddi);
-					if (ptrOk(prt) && !isHPDLow(prt)) {
-						if (auto src = edidFor(1)) for (int i = 0; i < 128; i++) b[i] = src[i];
-					}
-				}
-				return 0;
-			}
 			// The caller sets fb->flags = *online: report the HDMI sink as online together with its EDID
 			auto prt = getPortByDDI(tddi);
 			if (ptrOk(prt) && !isHPDLow(prt) && rd<uint32_t>(prt, L->portState) != 0) {
@@ -557,28 +558,12 @@ namespace HDMIB {
 		bool tgt = (ddi == tddi);
 		if (tgt) {
 			hotplugs++;
+			relightArmed = false;   // a real hotplug ends the previous wake cycle
 			lastPortMode = portMode;
 			gCtl = ctl;
 			ensureDbuf2(ctl);
 			auto tp = getPortByDDI ? getPortByDDI(tddi) : nullptr;
-			if (isHPDLow && ptrOk(tp) && isHPDLow(tp)) {   // cable/monitor removed: forget its EDID
-				liveEdidOk = false; edidForgotten++;
-				if (onlineFix) offlineOnce = 1;            // onlinefix: make the next online query report offline once
-				// realOnline: clear Apple's online byte on the target fb so the system sees a genuine disconnect
-				// and tears down the stale display path. Without this the fb stays "online" forever after wake.
-				if (realOnline) {
-					uint32_t idx = rd<uint32_t>(tp, L->portIndex);
-					uint32_t nfb = rd<uint32_t>(ctl, L->ctlFbCount);
-					if (idx < nfb && idx < 3) {
-						auto fb = rd<uint8_t *>(ctl, L->ctlFbArray + 8 * idx);
-						if (ptrOk(fb) && rd<uint32_t>(fb, L->fbIndex) == idx) {
-							wr<uint8_t>(fb, L->fbOnline, 0);
-							wr<uint8_t>(fb, L->fbFlags, rd<uint8_t>(fb, L->fbFlags) & ~1);
-							onlineCleared++;
-						}
-					}
-				}
-			}
+			if (isHPDLow && ptrOk(tp) && isHPDLow(tp)) { liveEdidOk = false; edidForgotten++; }   // cable/monitor removed: forget its EDID
 			else readLiveEdid(ctl);
 		}
 		orgHotplug(ctl, ddi, portMode);
@@ -613,8 +598,6 @@ namespace HDMIB {
 								if (ptrOk(dpx) && ptrOk(prt) && rd<void *>(dpx, L->pathPort) == nullptr) wr<void *>(dpx, L->pathPort, prt);
 							}
 							wr<uint8_t>(fb, L->fbFlags, rd<uint8_t>(fb, L->fbFlags) | 1);
-							// realOnline: restore Apple's online byte so the system sees a real connect and rebuilds the path
-							if (realOnline) { wr<uint8_t>(fb, L->fbOnline, 1); onlineSet++; }
 							// resource-configuration table (count + entry 0), cloned from the internal framebuffer's committed one,
 							// so setupDisplayTiming() can resolve the entry index it gets back from the client
 							auto fb0 = rd<uint8_t *>(ctl, L->ctlFbArray);
@@ -630,13 +613,41 @@ namespace HDMIB {
 	}
 
 	static uint32_t wrapLightUpTMDS(void *ctl, void *fb, void *path, void *timing) {
-		if (isTargetFb(fb)) ensureDbuf2(ctl);
+		if (isTargetFb(fb)) { ensureDbuf2(ctl); sampleWakePhy("LightUpTMDS"); }
 		return orgLightUpTMDS(ctl, fb, path, timing);
 	}
 	static uint32_t wrapHwSetMode(void *ctl, void *fb, void *path, int m, void *timing) {
 		armBootDetect(ctl);
-		if (isTargetFb(fb)) ensureDbuf2(ctl);
+		if (isTargetFb(fb)) { ensureDbuf2(ctl); sampleWakePhy("hwSetMode"); }
 		return orgHwSetMode(ctl, fb, path, m, timing);
+	}
+
+	// EXPERIMENTAL wake re-light. After prepareToEnterWake on the target framebuffer, arm a one-shot timer that
+	// re-runs the FULL, already-proven wrapHotplug() re-enumeration path (connChanged + allocPathRes + injectHPD).
+	// It uses only live objects (gCtl captured at hotplug, port fetched fresh) -- no cached fb/path/timing pointers.
+	static void relightFire(OSObject *owner, IOTimerEventSource *) {
+		wakeRelights++;
+		if (!gCtl || !getPortByDDI || !isHPDLow || !L) { HLOG("relight: prerequisites missing"); return; }
+		auto port = getPortByDDI(tddi);
+		if (!ptrOk(port) || isHPDLow(port)) { HLOG("relight: port absent or HPD low, skip"); return; }
+		sampleWakePhy("relight-before");
+		wrapHotplug(gCtl, tddi, lastPortMode ? lastPortMode : 1);
+		sampleWakePhy("relight-after");
+		HLOG("relight: hotplug re-run complete");
+	}
+	static void wrapPrepareToEnterWake(void *fb) {
+		if (wakeRelightMs > 0 && !relightArmed && isTargetFb(fb) && ptrOk(gCtl)) {
+			auto svc = reinterpret_cast<IOService *>(gCtl);
+			if (auto wl = svc->getWorkLoop()) {
+				auto t = IOTimerEventSource::timerEventSource(reinterpret_cast<OSObject *>(gCtl), relightFire);
+				if (t && wl->addEventSource(t) == 0) {
+					relightArmed = true;
+					t->setTimeoutMS((UInt32)wakeRelightMs);
+					HLOG("relight: armed %d ms", wakeRelightMs);
+				} else HLOG("relight: timer setup failed");
+			} else HLOG("relight: no workloop");
+		}
+		if (orgPrepareToEnterWake) orgPrepareToEnterWake(fb);
 	}
 
 	// ---------------------------------------------------------------------------------------------------------------------
@@ -777,9 +788,11 @@ namespace HDMIB {
 		auxBlockEnabled = intArg("igfxhdmib-aux", 1);
 		dc6FixEnabled = intArg("igfxhdmib-dc6fix", 1);
 		edidFallback = intArg("igfxhdmib-edid-fallback", 0);
-		onlineFix = intArg("igfxhdmib-onlinefix", 0);
-		realOnline = intArg("igfxhdmib-realonline", 0);
 		rgbMode = intArg("igfxhdmib-rgb", -1);
+		wakePhyEnabled = intArg("igfxhdmib-wakephy", 0) != 0;
+		wakeRelightMs = intArg("igfxhdmib-wakerelight", 0);
+		if (wakeRelightMs < 0) wakeRelightMs = 0;
+		HLOG_ALWAYS("wakephy=%d wakerelight=%dms", wakePhyEnabled, wakeRelightMs);
 
 		auto solve = [&](const char *sym) { return patcher.solveSymbol(index, sym, address, size); };
 		auto gp = solve("__ZN14AppleIntelPort12getPortByDDIEj");
@@ -830,6 +843,8 @@ namespace HDMIB {
 		optRoute(patcher, index, address, size, "__ZN31AppleIntelFramebufferController16hwSetCursorImageEP21AppleIntelFramebufferP20IOHardwareCursorInfo", wrapHwSetCursorImage, orgHwSetCursorImage, "hwSetCursorImage");
 		optRoute(patcher, index, address, size, "__ZN31AppleIntelFramebufferController16hwSetCursorStateEP21AppleIntelFramebufferiibb", wrapHwSetCursorState, orgHwSetCursorState, "hwSetCursorState");
 		optRoute(patcher, index, address, size, "__ZN21AppleIntelFramebuffer11initVRRCapsEv", wrapInitVRRCaps, orgInitVRRCaps, "initVRRCaps");
+		if (wakeRelightMs > 0)
+			optRoute(patcher, index, address, size, "__ZN21AppleIntelFramebuffer18prepareToEnterWakeEv", wrapPrepareToEnterWake, orgPrepareToEnterWake, "prepareToEnterWake");
 		if (dc6FixEnabled)
 			optRoute(patcher, index, address, size, "__ZN31AppleIntelFramebufferController11enableHWDC6Ev", wrapEnableHWDC6, orgEnableHWDC6, "enableHWDC6");
 
