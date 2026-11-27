@@ -2,31 +2,7 @@
 //  kern_igfx_hdmib.hpp
 //  HDMI on DDI B for AppleIntelICLLPGraphicsFramebuffer (Intel Ice Lake, macOS 15 / 26)
 //
-//  Header-only module for WhateverGreen. Version 1.0-up08.
-//  Based on upstream 1.0-rc6 (miyatimusica) with these additions only:
-//    * default-on (no -igfxhdmib boot-arg; -igfxhdmiboff disables)
-//    * connector patch injected as DeviceProperties by the module itself (no config framebuffer-patch0 needed)
-//    * platform-table scan retargeted to 0x8A510002 (02id 0x8A5C0002 has a defective wake path; both
-//      ids share the same connector template, so the same find/replace bytes work on 8A51)
-//    * wake complete-modeset rescue: Apple's Ice Lake LightUpTMDS is a stub that ALWAYS errors, so a
-//      wake needing a full modeset can never light the HDMI port; from 90s after boot the module
-//      reroutes it to the real LightUpDP instead (boot window keeps stock behaviour, bit-identical
-//      to the proven-safe up05 boot)
-//    * platform-table lookup: one fixed 8 KiB window, target id set by the build script (0x8A510002 since up05)
-//    * up06: LightUpTMDS -> LightUpDP reroute. Apple's ICL LightUpTMDS is a stub that always returns error,
-//      so any wake that needs a complete modeset kills the screen (kernel log: "Returning error in TMDS
-//      modeset as this platform does not do support HDMI/DVI connector"). The DP light-up path is real and
-//      the module's sink fakes already cover it.
-//    * up04: the wake-time HPD race fix from hj13 (wb1, issue #37 port), carried back in full:
-//        - wrapProbePortState: if a probe reads HPD low, wait 1500 us for the SHPD filter to settle and
-//          re-read; only treat it as low if it is still low after settling (the CAUSE fix), and never
-//          write portState=0 on the low path (the RESULT fix). Kernel log proof from the up03 run:
-//          after the first wake, Apple re-enumerates within microseconds of the HPD input being
-//          re-enabled, latches a false state, treats DDI B as a DP sink again (fIsHDMI=0), and the
-//          AUX-DPCD writes fail forever (writeAUX 0x4e0, 0xe00002f0) in a 3-4 s hotplug loop.
-//        - wrapGetDDCBlock: no ensurePW() here, exactly as hj13 measured it (writing the power well
-//          from inside Apple's own wake-time DDC transaction stalls the GMBUS counter).
-//  All other functional hooks are left exactly as upstream rc6.
+//  Header-only module for WhateverGreen. Version 1.0-rc6 (internally "v46").
 //
 //  Why it exists
 //  -------------
@@ -41,9 +17,9 @@
 //
 //  Requirements
 //  ------------
-//    * The HDMI connector has to exist in the platform table. This build injects framebuffer-patch0 itself as
-//      DeviceProperties on the iGPU (unless you already configured framebuffer-patch0-find, which then wins).
-//    * The module is ON by default; -igfxhdmiboff disables it. No -igfxhdmib boot-arg is needed.
+//    * The HDMI connector has to exist in the platform table. Add it with DeviceProperties on the iGPU
+//      (framebuffer-patchN-*), see README.md. Its {ddi, gmbus pin, class, pad, type, flags} are read back from the driver.
+//    * Boot-arg  -igfxhdmib   enables the module. Without it the module does nothing at all.
 //
 //  Boot-args (all optional)
 //    igfxhdmib-ddi=N          DDI that carries the HDMI port (default 1 = DDI B)
@@ -60,6 +36,11 @@
 //                               -1 (default) = automatic: if the EDID advertises YCbCr, behave as 2; otherwise leave the EDID untouched
 //                                2 = hide YCbCr support AND the CEA extension block, the sink is treated as plain DVI/RGB (no infoframes)
 //                                1 = only hide the YCbCr bits   0 = never touch the EDID
+//    igfxhdmib-hpddebounce=0|1  1 (EXPERIMENTAL, default 0 = upstream behaviour) = after a wake-up HPD-high edge on the target
+//                             DDI, swallow transient HPD-low edges for a short window so CoreDisplay does not mark the
+//                             external display offline before WindowServer has finished its ~5 s modeset. Nothing is changed
+//                             at all unless this boot-arg is present.
+//    igfxhdmib-hpddebounce-ms=N  length of that suppression window in ms (default 5000, clamped 1000..15000).
 //    igfxhdmib-force=1        run on a macOS version whose private structure layout has not been verified (see Layout)
 //
 //  Diagnostics:  ioreg -l | grep HDMIB      (HDMIB-status, HDMIB-layout, HDMIB-hooks)
@@ -83,7 +64,7 @@
 
 namespace HDMIB {
 
-	static constexpr const char *Version = "1.0-up08";
+	static constexpr const char *Version = "1.0-rc6";
 
 	// IOLog directly: Lilu's SYSLOG is silent when interrupts are disabled (hotplug paths run that way).
 	#define HLOG(fmt, ...) do { if (ml_get_interrupts_enabled()) IOLog("HDMIB: " fmt "\n", ## __VA_ARGS__); } while (0)
@@ -148,6 +129,10 @@ namespace HDMIB {
 	static int      fbIdx = 2;                // target framebuffer index
 	static bool     fbIdxFixed = false;       // set by igfxhdmib-fb
 	static int      rgbMode = -1, rgbOnly = 0, hwCursorFb = 1, swCursorAll = 0, auxBlockEnabled = 1, dc6FixEnabled = 1, edidFallback = 0, bootDetectSec = 3;
+	static int      hpdDebounce = 0;          // igfxhdmib-hpddebounce=1 (EXPERIMENTAL): suppress HPD-low inside the post-wake window
+	static uint32_t hpdDebounceMs = 5000;     // suppression window length
+	static uint64_t hpdHighAt = 0;            // mach_absolute_time() of the last target HPD-high edge (ns on x86_64)
+	static uint32_t hpdLowSuppressed = 0;     // HPD-low edges swallowed by the window
 	static void    *gCtl = nullptr;           // AppleIntelFramebufferController, captured at the first hotplug
 
 	static void *(*getPortByDDI)(uint32_t) = nullptr;
@@ -170,32 +155,14 @@ namespace HDMIB {
 	static IOReturn (*orgStreamAux)(void *, void *, void *) = nullptr;
 	static bool (*orgCallbackAGDC)(void *, uint32_t, unsigned long, uint32_t) = nullptr;
 	static uint32_t (*orgLightUpTMDS)(void *, void *, void *, void *) = nullptr;
-	static uint32_t (*orgLightUpDP)(void *, void *, void *, void *) = nullptr;
-	static uint32_t tmdsToDp = 0;   // up06: complete-modeset rescues through the real DP light-up path
-	static uint64_t moduleStartAbs = 0;   // up07: mach_absolute_time at hook install; reroute only after 90s
-	// up08: wake replug pulse. The 18:40:50 wake proved WindowServer DOES issue a setMode right after
-	// wake, but Apple rejects it with "Ignoring mode set on unplugged display" because fOnline is
-	// still 0 during the wake race; once the port comes online nobody re-issues a mode set and the
-	// port stays "online but not enabled" forever (no hwSetMode, so the reroute never gets a chance).
-	// Fix: a few seconds after each wake, report the sink offline for one poll window — WindowServer
-	// then tears the display down and, on the next online report, runs a fresh connect, which is the
-	// only path that ends in a real hwSetMode (and thus in the TMDS->DP reroute).
-	static uint64_t lastTgtHotplugAbs = 0;
-	static uint64_t replugArmAbs = 0;
-	static int      replugStage = 0;      // 0 = pulse allowed, 1 = offline window open, 2 = done for this wake
-	static uint32_t replugPulses = 0;
-	static IOTimerEventSource *replugTimer = nullptr;
 	static uint32_t (*orgHwSetMode)(void *, void *, void *, int, void *) = nullptr;
 	static uint32_t (*orgHwSetCursorImage)(void *, void *, void *) = nullptr;
 	static uint32_t (*orgHwSetCursorState)(void *, void *, int, int, bool, bool) = nullptr;
 	static void (*orgInitVRRCaps)(void *) = nullptr;
 	static void (*orgEnableHWDC6)(void *) = nullptr;
 
-	static uint32_t hotplugs = 0, lastPortMode = 0;   // hotplugs: verification counter; lastPortMode: functional (bootDetect)
-	// up04 (hj13 wb1, issue #37 port): the wake-time HPD race counters. The only diagnostics kept from hj13:
-	// hpdSettleRescues > 0 after a wake is the direct proof the settle fix did its job.
-	static int      hpdSettleEnabled = 1;   // wait for the SHPD filter before trusting a low isHPDLow()
-	static uint32_t hpdLowProbes = 0, hpdSettleChecks = 0, hpdSettleRescues = 0;
+	static uint32_t edidForgotten = 0, hotplugs = 0, lastPortMode = 0, edidReads = 0, edidFails = 0, dbufFixed = 0, dc6Skipped = 0, auxBlocked = 0,
+	                cursorBlocked = 0, vrrOff = 0;
 
 	// ---------------------------------------------------------------------------------------------------------------------
 	// Helpers
@@ -224,14 +191,15 @@ namespace HDMIB {
 	static void publishStatus() {
 		if (!ml_get_interrupts_enabled()) return;
 		char s[192];
-		snprintf(s, sizeof(s), "hotplugs=%u lowprobes=%u rescued=%u tmdsdp=%u replug=%u fb=%d ddi=%u", hotplugs, hpdLowProbes, hpdSettleRescues, tmdsToDp, replugPulses, fbIdx, tddi);
+		snprintf(s, sizeof(s), "hotplugs=%u edid-ok=%u edid-fail=%u dbuf-fixed=%u dc6-skipped=%u aux-blocked=%u cursor-blocked=%u fb=%d ddi=%u debounce=%d ms=%u supp=%u",
+		         hotplugs, edidReads, edidFails, dbufFixed, dc6Skipped, auxBlocked, cursorBlocked, fbIdx, tddi, hpdDebounce, hpdDebounceMs, hpdLowSuppressed);
 		setRoot("HDMIB-status", s);
 		if (liveEdidOk) {
 			char e[224];
 			const uint8_t *d = liveEdid;
 			char m[4] = { (char)(64 + ((d[8] >> 2) & 31)), (char)(64 + (((d[8] & 3) << 3) | (d[9] >> 5))), (char)(64 + (d[9] & 31)), 0 };
-			snprintf(e, sizeof(e), "mfg=%s product=0x%02x%02x serial=0x%02x%02x%02x%02x year=%u blocks=%u bpc-byte=0x%02x input=0x%02x feat=0x%02x ext=%u cea3=0x%02x rgb=%d",
-			         m, d[11], d[10], d[15], d[14], d[13], d[12], 1990u + d[17], gmBlocks, d[20] & 0x70, d[20], d[24], d[126], gmBlocks >= 2 ? d[131] : 0, rgbOnly);
+			snprintf(e, sizeof(e), "mfg=%s product=0x%02x%02x serial=0x%02x%02x%02x%02x year=%u blocks=%u bpc-byte=0x%02x input=0x%02x feat=0x%02x ext=%u cea3=0x%02x rgb=%d forgotten=%u",
+			         m, d[11], d[10], d[15], d[14], d[13], d[12], 1990u + d[17], gmBlocks, d[20] & 0x70, d[20], d[24], d[126], gmBlocks >= 2 ? d[131] : 0, rgbOnly, edidForgotten);
 			setRoot("HDMIB-edid", e);
 		} else setRoot("HDMIB-edid", "none (Apple's own answer is used)");
 		// Self-diagnosis of the connector table: shows what the driver really has on the target DDI.
@@ -273,6 +241,7 @@ namespace HDMIB {
 				if (readReg(ctl, REG_DBUF_CTL_S2) & 0x40000000u) break;
 				IODelay(10);
 			}
+			dbufFixed++;
 		}
 	}
 
@@ -446,6 +415,7 @@ namespace HDMIB {
 				}
 			}
 		}
+		if (liveEdidOk) edidReads++; else edidFails++;
 		return liveEdidOk;
 	}
 
@@ -489,38 +459,9 @@ namespace HDMIB {
 	static uint32_t wrapProbePortState(void *that) {
 		if (!isTarget(that)) return orgProbePortState(that);
 		bool hpdLow = isHPDLow ? isHPDLow(that) : true;
-		// up04 — hj13 wb1, port of issue #37 (HP Elite Dragonfly G2 / Tiger Lake DDI-B HDMI):
-		// on wake, AppleIntelPort::probePortState() is called within microseconds of the DDI-B HPD input being
-		// (re)enabled. SHPD_FILTER_CNT needs ~500 us to settle, so the first read can latch a false LOW even though
-		// the sink is still connected; that latches portState=0 and the port is dropped from the wake list. On this
-		// Ice Lake machine the input is already enabled in steady state (measured ddi_b_hpd_en=1, sde_b_hpd=1), so
-		// this is NOT a boot-time enable problem — it is the wake-time race. up03 handled only the *result* (don't
-		// write 0 on a low probe) and still failed on the first wake: with the stale portState kept, Apple's own
-		// re-enumeration ran with the race intact and re-registered the port as a DP sink (fIsHDMI=0), which then
-		// looped on AUX-DPCD writes forever. This adds the *cause* fix from hj13: if a probe sees LOW, wait 1500 us
-		// for the filter and re-read; only commit the low path if it is still low after settling. Read-only apart
-		// from IODelay — no register is written, so it cannot reintroduce the power-well/DBUF regressions.
-		// Disabled by igfxhdmib-hpdsettle=0 to fall back to the plain "never write 0" behaviour.
-		if (hpdLow && hpdSettleEnabled) {
-			hpdSettleChecks++;
-			IODelay(1500);
-			bool hpdLowAfter = isHPDLow ? isHPDLow(that) : true;
-			if (!hpdLowAfter) {
-				hpdSettleRescues++;
-				hpdLow = false;    // line recovered after the filter settled: treat as connected
-			}
-		}
-		if (hpdLow) {
-			// Do NOT write 0 here (hj13 result fix, kept): HPD on this port pulses low for a few milliseconds during
-			// every sleep/wake cycle, and that is exactly when Apple calls probePortState to decide whether the
-			// framebuffer still owns a pipe. Writing 0 at that moment takes the framebuffer off the wake list.
-			// Keeping the previous value (2 stays 2, 0 stays 0) costs nothing when the port is really alive, and
-			// Apple's own hotplug handler retires a genuinely unplugged sink.
-			hpdLowProbes++;
-			return rd<uint32_t>(that, L->portState);
-		}
-		wr<uint32_t>(that, L->portState, 1);
-		return 1;
+		uint32_t state = hpdLow ? 0 : 1;
+		wr<uint32_t>(that, L->portState, state);
+		return state;
 	}
 	static int wrapSetDPPower(void *that, uint8_t state) {
 		if (!isTarget(that)) return orgSetDPPower(that, state);
@@ -537,12 +478,7 @@ namespace HDMIB {
 	}
 	static int wrapGetDDCBlock(void *that, uint32_t block, uint8_t *buf, bool flag) {
 		if (!isTarget(that)) return orgGetDDCBlock(that, block, buf, flag);
-		// up04 (hj13): no ensurePW() here. This call site runs once per wake, inside Apple's own DDC transaction, and
-		// the power-well write is a Haswell-style guess (STATE at bit 2n, REQUEST at 2n+1) aimed at an Ice Lake
-		// register Apple is actively driving: waking from sleep is exactly when the wells are in transition. hj13
-		// measured enpw going up by exactly one per wake even on the wakes that failed with a flat GMBUS counter,
-		// i.e. this site was the only code touching a register. If Apple's read fails because the well is genuinely
-		// down, the cached EDID below covers it.
+		ensurePW();
 		int ret = orgGetDDCBlock(that, block, buf, flag);
 		if (ret != 0 && (block == 1 || block == 2) && buf) {
 			// The sink did not answer through Apple's (DisplayPort-oriented) DDC path: hand over the EDID we read ourselves
@@ -555,18 +491,6 @@ namespace HDMIB {
 	static IOReturn wrapGetOnlineInfo(void *that, void *path, uint8_t *a, uint8_t *b) {
 		auto ret = orgGetOnlineInfo(that, path, a, b);
 		if (a && b && isTargetFb(that) && getPortByDDI && isHPDLow) {
-			// up08: during the replug-pulse window report the sink as UNPLUGGED. WindowServer then
-			// disconnects the display; on the next poll (window closed) it reconnects and issues a
-			// real mode set, which is what "Ignoring mode set on unplugged display" swallowed.
-			if (replugStage == 1) {
-				if (mach_absolute_time() - replugArmAbs < 3000ULL * 1000000000ULL) {
-					*a = 0;
-					ret = 0;
-					return ret;
-				}
-				replugStage = 2;
-				HLOG("replug window closed via poll");
-			}
 			// The caller sets fb->flags = *online: report the HDMI sink as online together with its EDID
 			auto prt = getPortByDDI(tddi);
 			if (ptrOk(prt) && !isHPDLow(prt) && rd<uint32_t>(prt, L->portState) != 0) {
@@ -606,33 +530,6 @@ namespace HDMIB {
 		t->setTimeoutMS((UInt32)bootDetectSec * 1000u);
 	}
 
-	// up08: wake replug pulse — fire 3s after a wake is detected; the offline window stays open 3s
-	// (covers hotplug/enumeration loops with a 3-6s period) and is closed either by a poll after the
-	// window or by this timer, whichever comes first.
-	static void replugFire(OSObject *owner, IOTimerEventSource *) {
-		if (replugStage == 0) {
-			replugStage = 1;
-			replugPulses++;
-			replugArmAbs = mach_absolute_time();
-			HLOG("wake replug pulse #%u: offline window open", replugPulses);
-			if (replugTimer) replugTimer->setTimeoutMS(3000);   // close even if no poll arrives
-		} else if (replugStage == 1) {
-			replugStage = 2;
-			HLOG("wake replug pulse: window closed, reporting online again");
-		}
-		publishStatus();
-	}
-	static void armReplugTimer(void *ctl) {
-		if (replugTimer || !ptrOk(ctl)) return;
-		auto svc = reinterpret_cast<IOService *>(ctl);
-		IOWorkLoop *wl = svc->getWorkLoop();
-		if (!wl) { HLOG("replug: no workloop"); return; }
-		auto t = IOTimerEventSource::timerEventSource(reinterpret_cast<OSObject *>(ctl), replugFire);
-		if (!t) { HLOG("replug: no timer"); return; }
-		if (wl->addEventSource(t) != 0) { t->release(); HLOG("replug: addEventSource failed"); return; }
-		replugTimer = t;
-	}
-
 	static void wrapHotplug(void *ctl, uint32_t ddi, uint32_t portMode) {
 		bool tgt = (ddi == tddi);
 		if (tgt) {
@@ -640,21 +537,22 @@ namespace HDMIB {
 			lastPortMode = portMode;
 			gCtl = ctl;
 			ensureDbuf2(ctl);
-			// up08: wake detection — one replug pulse per wake; never at boot (90s gate) and never for
-			// hotplug bursts of the same wake (30s of silence separates two wakes).
-			if (moduleStartAbs != 0 && replugTimer) {
+			auto tp = getPortByDDI ? getPortByDDI(tddi) : nullptr;
+			bool low = isHPDLow && ptrOk(tp) && isHPDLow(tp);
+			if (hpdDebounce) {
+				// x86_64: mach_absolute_time() ticks are nanoseconds.
 				uint64_t now = mach_absolute_time();
-				bool wakePhase = now - moduleStartAbs > 90ULL * 1000000000ULL;
-				bool newWake = wakePhase && (lastTgtHotplugAbs == 0 || now - lastTgtHotplugAbs > 30ULL * 1000000000ULL);
-				lastTgtHotplugAbs = now;
-				if (newWake) {
-					replugStage = 0;
-					replugTimer->setTimeoutMS(3000);
-					HLOG("wake detected: replug pulse fires in 3s");
+				if (!low) {
+					hpdHighAt = now;                       // every target HPD-high edge (re)arms the window
+				} else if (hpdHighAt && (now - hpdHighAt) < (uint64_t)hpdDebounceMs * 1000000ULL) {
+					// Apple would turn this edge into an "Event remove"; CoreDisplay then marks the external
+					// display offline and never sends a modeset again. Swallow only the low edge; leave the
+					// rest of the target path untouched. A real unplug after the window still works normally.
+					hpdLowSuppressed++;
+					return;
 				}
 			}
-			auto tp = getPortByDDI ? getPortByDDI(tddi) : nullptr;
-			if (isHPDLow && ptrOk(tp) && isHPDLow(tp)) liveEdidOk = false;   // cable/monitor removed: forget its EDID
+			if (low) { liveEdidOk = false; edidForgotten++; }   // cable/monitor removed: forget its EDID
 			else readLiveEdid(ctl);
 		}
 		orgHotplug(ctl, ddi, portMode);
@@ -704,32 +602,11 @@ namespace HDMIB {
 	}
 
 	static uint32_t wrapLightUpTMDS(void *ctl, void *fb, void *path, void *timing) {
-		if (isTargetFb(fb)) {
-			ensureDbuf2(ctl);
-			if (orgLightUpDP) {
-				// up06: Apple's Ice Lake LightUpTMDS is a stub that ALWAYS returns error ("Returning error
-				// in TMDS modeset as this platform does not do support HDMI/DVI connector") because every
-				// Ice Lake Mac ships HDMI via DP dongles only. Whenever a wake needs a complete modeset,
-				// hwSetMode dispatches here by port type and the screen is guaranteed dead. LightUpDP is
-				// the real light-up path (power wells, clocks, AGDC link event, scaler, pipe enable); the
-				// module's AGDC/AUX/online hooks already fake the sink side, so send the HDMI port there.
-				// up07: only AFTER the boot window. Evidence from the 17:22 hard-hang boot: no
-				// "Lighting up TMDS" dispatch was ever logged, so boot never reaches this wrapper for a
-				// modeset (boot lights the port via the AGDC virtual-online path). The uptime guard makes
-				// boot behaviour bit-identical to the proven-safe up05 while keeping the wake rescue.
-				uint64_t now = mach_absolute_time();
-				if (moduleStartAbs != 0 && now - moduleStartAbs > 90ULL * 1000000000ULL) {
-					tmdsToDp++;
-					HLOG("tmds->dp reroute #%u (wake complete modeset)", tmdsToDp);
-					return orgLightUpDP(ctl, fb, path, timing);
-				}
-			}
-		}
+		if (isTargetFb(fb)) ensureDbuf2(ctl);
 		return orgLightUpTMDS(ctl, fb, path, timing);
 	}
 	static uint32_t wrapHwSetMode(void *ctl, void *fb, void *path, int m, void *timing) {
 		armBootDetect(ctl);
-		armReplugTimer(ctl);   // up08: create the wake-pulse timer on the controller's workloop
 		if (isTargetFb(fb)) ensureDbuf2(ctl);
 		return orgHwSetMode(ctl, fb, path, m, timing);
 	}
@@ -756,6 +633,7 @@ namespace HDMIB {
 		uint32_t port = (in && ptrOk(in)) ? *reinterpret_cast<uint32_t *>(in) : 0xffff;
 		if (auxBlockEnabled && port == (uint32_t)fbIdx + 1 && out && ptrOk(out)) {
 			*reinterpret_cast<uint16_t *>(reinterpret_cast<uint8_t *>(out) + 0xe) = 2;
+			auxBlocked++;
 			return (IOReturn)0xe00002bc;
 		}
 		return orgStreamAux(c, in, out);
@@ -788,11 +666,11 @@ namespace HDMIB {
 		return tgt || swCursorAll != 0;
 	}
 	static uint32_t wrapHwSetCursorImage(void *ctl, void *fb, void *info) {
-		if (cursorBlockedFor(ctl, fb)) return 0xe00002c7;
+		if (cursorBlockedFor(ctl, fb)) { if (++cursorBlocked == 1) HLOG("hardware cursor refused on the HDMI framebuffer (software cursor)"); return 0xe00002c7; }
 		return orgHwSetCursorImage(ctl, fb, info);
 	}
 	static uint32_t wrapHwSetCursorState(void *ctl, void *fb, int a, int b, bool c, bool d) {
-		if (cursorBlockedFor(ctl, fb)) return 0xe00002c7;
+		if (cursorBlockedFor(ctl, fb)) { cursorBlocked++; return 0xe00002c7; }
 		return orgHwSetCursorState(ctl, fb, a, b, c, d);
 	}
 
@@ -802,13 +680,13 @@ namespace HDMIB {
 	// The HDMI timing generates VRR errors every ~11 s: no VRR on that framebuffer.
 	static void wrapInitVRRCaps(void *fb) {
 		orgInitVRRCaps(fb);
-		if (isTargetFb(fb)) { for (uint32_t i = 0; i < 5; i++) wr<uint8_t>(fb, L->fbVrr + i, 0); }
+		if (isTargetFb(fb)) { for (uint32_t i = 0; i < 5; i++) wr<uint8_t>(fb, L->fbVrr + i, 0); vrrOff++; }
 	}
 	// Apple panics ("[IGFB][PANIC][POWER] DC6 is already enabled - bailing out") when enableHWDC6() runs while its reference count is
 	// already > 0, i.e. two enables without a disable in between. This happens from setDisplayMode -> disableDisplay during repeated
 	// HDMI hot-plugging. Skipping the extra enable leaves DC6 enabled by the first one; a later disable turns it off.
 	static void wrapEnableHWDC6(void *c) {
-		if (dc6FixEnabled && ptrOk(c) && rd<int32_t>(c, L->ctlDC6Count) > 0) return;
+		if (dc6FixEnabled && ptrOk(c) && rd<int32_t>(c, L->ctlDC6Count) > 0) { dc6Skipped++; return; }
 		orgEnableHWDC6(c);
 	}
 
@@ -822,18 +700,9 @@ namespace HDMIB {
 		if (!patcher.routeMultiple(index, &rq, 1, address, size)) HLOG_ALWAYS("optional hook %s could not be routed", what);
 	}
 
-	// up02: inject the connector patch as DeviceProperties before WhateverGreen reads them.
-	// WhateverGreen's IGFX::processKernel() calls loadPatchesFromDevice(info->videoBuiltin, ...) which reads
-	// framebuffer-patchN-* off the iGPU device node. We set those properties just before that call, so the
-	// upstream patch code does the work - no config.plist framebuffer-patch0 needed. The find/replace bytes
-	// are the ones proven to light up DDI B on this 02id machine (carried over from the working fork build).
-	// If framebuffer-patch0-find is already configured on the iGPU, that configuration wins.
 	static void injectDeviceProperties(IORegistryEntry *igpu) {
 		if (!igpu) return;
-		if (igpu->getProperty("framebuffer-patch0-find")) {
-			HLOG_ALWAYS("connector patch already present on the iGPU, injection skipped");
-			return;
-		}
+		if (igpu->getProperty("framebuffer-patch0-find")) return;
 		auto setBytes = [&](const char *key, const void *bytes, uint32_t len) {
 			auto data = OSData::withBytes(bytes, len);
 			if (!data) return;
@@ -847,11 +716,10 @@ namespace HDMIB {
 		setBytes("framebuffer-patch0-enable", &on, sizeof(on));
 		setBytes("framebuffer-patch0-find", find, sizeof(find));
 		setBytes("framebuffer-patch0-replace", replace, sizeof(replace));
-		HLOG_ALWAYS("connector patch injected: ddi 3/DP -> ddi 1/HDMI (gmbus=2, type=0x800)");
 	}
 
 	static inline void install(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
-		if (checkKernelArgument("-igfxhdmiboff")) return;      // up02: default ON; only the off switch disables
+		if (checkKernelArgument("-igfxhdmiboff")) return;
 		if (kextIntelICLLPFb.loadIndex != index) return;      // only the Ice Lake LP framebuffer kext
 		HLOG_ALWAYS("v%s starting on Darwin %u", Version, (unsigned)getKernelVersion());
 
@@ -880,12 +748,13 @@ namespace HDMIB {
 		swCursorAll = intArg("igfxhdmib-swcursor", 0);
 		auxBlockEnabled = intArg("igfxhdmib-aux", 1);
 		dc6FixEnabled = intArg("igfxhdmib-dc6fix", 1);
-		hpdSettleEnabled = intArg("igfxhdmib-hpdsettle", 1) != 0;   // up04: hj13 wake-race settle (0 = plain "never write 0")
 		edidFallback = intArg("igfxhdmib-edid-fallback", 0);
+		hpdDebounce = intArg("igfxhdmib-hpddebounce", 0);
+		hpdDebounceMs = (uint32_t)intArg("igfxhdmib-hpddebounce-ms", 5000);
+		if (hpdDebounceMs < 1000 || hpdDebounceMs > 15000) hpdDebounceMs = 5000;
 		rgbMode = intArg("igfxhdmib-rgb", -1);
 
 		auto solve = [&](const char *sym) { return patcher.solveSymbol(index, sym, address, size); };
-		moduleStartAbs = mach_absolute_time();   // up07: reroute boot-phase guard reference
 		auto gp = solve("__ZN14AppleIntelPort12getPortByDDIEj");
 		auto hp = solve("__ZN14AppleIntelPort8isHPDLowEv");
 		auto rr = solve("__ZN31AppleIntelFramebufferController14ReadRegister32Em");
@@ -895,10 +764,6 @@ namespace HDMIB {
 		auto apr = solve("__ZN21AppleIntelFramebuffer28allocateDisplayPathResourcesEjj");
 		auto ihpd = solve("__ZN31AppleIntelFramebufferController9InjectHPDEP21AppleIntelFramebuffer");
 		auto uc = solve("__ZN31AppleIntelFramebufferController20hwUpdateCursorMemoryEP21AppleIntelFramebuffer");
-		// up06: real DP light-up path, used to replace the always-failing LightUpTMDS stub (optional: if
-		// missing, the stub keeps its stock failing behaviour).
-		auto ldp = solve("__ZN31AppleIntelFramebufferController9LightUpDPEP21AppleIntelFramebufferP21AppleIntelDisplayPathPK29IODetailedTimingInformationV2");
-		if (ldp) orgLightUpDP = reinterpret_cast<uint32_t (*)(void *, void *, void *, void *)>(ldp);
 		if (!gp || !hp || !rr || !wrg || !ihpd) {
 			HLOG_ALWAYS("required symbols missing (getPortByDDI=%d isHPDLow=%d ReadRegister32=%d WriteRegister32=%d InjectHPD=%d): module idle",
 			            gp != 0, hp != 0, rr != 0, wrg != 0, ihpd != 0);
@@ -941,7 +806,7 @@ namespace HDMIB {
 		if (dc6FixEnabled)
 			optRoute(patcher, index, address, size, "__ZN31AppleIntelFramebufferController11enableHWDC6Ev", wrapEnableHWDC6, orgEnableHWDC6, "enableHWDC6");
 
-		HLOG_ALWAYS("hooks installed (ddi=%u fb=%d bootdetect=%ds hwcursor=%d)", tddi, fbIdx, bootDetectSec, hwCursorFb);
+		HLOG_ALWAYS("hooks installed (ddi=%u fb=%d bootdetect=%ds hwcursor=%d hpddebounce=%d/%ums)", tddi, fbIdx, bootDetectSec, hwCursorFb, hpdDebounce, hpdDebounceMs);
 		setRoot("HDMIB-hooks", "installed");
 		publishStatus();
 	}

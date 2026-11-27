@@ -26,45 +26,21 @@ cp -R MacKernelSDK Lilu/MacKernelSDK
 cp -R "$W/lilu_out/Debug/Lilu.kext" WhateverGreen/Lilu.kext
 cp -R MacKernelSDK WhateverGreen/MacKernelSDK
 
-# 2) Add the module to WhateverGreen (three edits to kern_igfx.cpp)
+# 2) Add the module to WhateverGreen (two small edits to kern_igfx.cpp)
 cp "$HERE/kern_igfx_hdmib.hpp" WhateverGreen/WhateverGreen/
 F=WhateverGreen/WhateverGreen/kern_igfx.cpp
 perl -0pi -e 's/(#include "kern_igfx\.hpp"\n)/$1#include "kern_igfx_hdmib.hpp"\n/' "$F"
-# up02: inject the connector DeviceProperties before WhateverGreen reads them (default-on, no config patch needed)
 perl -0pi -e 's/(\t\tapplyFramebufferPatch = loadPatchesFromDevice\()/\t\tHDMIB::injectDeviceProperties(info->videoBuiltin);\n\n$1/' "$F"
 perl -0pi -e 's/(\t\tif \(applyFramebufferPatch \|\| dumpFramebufferToDisk \|\| dumpPlatformTable \|\| hdmiAutopatch\) \{\n\t\t\tframebufferStart)/\t\tHDMIB::install(patcher, index, address, size);\n\n$1/' "$F"
-
-# up05: 8A51-only platform-table lookup (platform-id experiment 0x8A510002). Same fixed 8 KiB window
-# scan as up02, retargeted to 0x8A510002, plus a one-shot hex dump of the table bytes around the hit
-# (prefix HDMIBTBL) so the runtime connector layout can be verified from the kernel log.
 cat > "$W/find_framebuffer_id.cpp" <<'FBIDEOF'
-extern "C" void IOLog(const char *fmt, ...);
-
 uint8_t *IGFX::findFramebufferId(uint32_t framebufferId, uint8_t *startingAddress, size_t maxSize) {
 	(void)framebufferId;
 	(void)maxSize;
 	uint32_t *p = reinterpret_cast<uint32_t *>(startingAddress);
 	uint32_t *end = reinterpret_cast<uint32_t *>(startingAddress + 0x2000);
 	for (; p < end; p++)
-		if (*p == 0x8A510002u) {
-			static bool dumped = false;
-			uint8_t *base = reinterpret_cast<uint8_t *>(p);
-			uint8_t *lim  = startingAddress + 0x2000;
-			if (!dumped) {
-				dumped = true;
-				IOLog("HDMIBTBL: hit arg=%08x base=%p start=%p\n", framebufferId,
-					reinterpret_cast<void *>(base), reinterpret_cast<void *>(startingAddress));
-				uint8_t *q = base >= startingAddress + 128 ? base - 128 : startingAddress;
-				for (; q + 32 <= lim; q += 32) {
-					char line[160];
-					int n = snprintf(line, sizeof(line), "HDMIBTBL off=%+ld:", static_cast<long>(q - base));
-					for (int k = 0; k < 32 && n > 0 && n < static_cast<int>(sizeof(line)) - 4; k++)
-						n += snprintf(line + n, sizeof(line) - n, " %02x", q[k]);
-					IOLog("%s\n", line);
-				}
-			}
-			return base;
-		}
+		if (*p == 0x8A5C0002u)
+			return reinterpret_cast<uint8_t *>(p);
 	return nullptr;
 }
 FBIDEOF
@@ -72,10 +48,9 @@ FBID_NEW="$W/find_framebuffer_id.cpp" perl -0777 -i -pe '
 	BEGIN { open(my $fh, "<", $ENV{FBID_NEW}) or die "cannot read the replacement text"; local $/; $new = <$fh>; }
 	s{uint8_t \*IGFX::findFramebufferId\(uint32_t framebufferId, uint8_t \*startingAddress, size_t maxSize\) \{.*?\n\}}{$new}s;
 ' "$F"
-
 [ "$(grep -c 'HDMIB::install' "$F")" = "1" ] && [ "$(grep -c 'kern_igfx_hdmib.hpp' "$F")" = "1" ] \
   && [ "$(grep -c 'HDMIB::injectDeviceProperties' "$F")" = "1" ] \
-  && [ "$(grep -c '0x8A510002u' "$F")" = "1" ] \
+  && [ "$(grep -c '0x8A5C0002u' "$F")" = "1" ] \
   || { echo "ERROR: the edits to kern_igfx.cpp could not be applied (this WhateverGreen version differs). See README.md, 'Hooking into WhateverGreen'."; exit 1; }
 
 # 3) WhateverGreen
